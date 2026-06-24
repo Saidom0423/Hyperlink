@@ -1,11 +1,13 @@
+
+
 class FileChunk {
   final String transferId;
   final int sequenceNumber;
   final int totalChunks;
-  final List<int> data;         // raw bytes
-  final String checksum;        // SHA-256 of data
-  final String destinationId;   // final recipient device ID
-  final String originId;        // sender device ID
+  final List<int> data;
+  final String checksum;
+  final String destinationId;
+  final String originId;
 
   const FileChunk({
     required this.transferId,
@@ -17,25 +19,23 @@ class FileChunk {
     required this.originId,
   });
 
-  // Serialize to bytes for TCP wire format
-  // [4B transferId len][transferId][4B seq][4B total][4B dataLen][data][64B checksum]
   List<int> toBytes() {
     final tid = transferId.codeUnits;
     final dest = destinationId.codeUnits;
     final orig = originId.codeUnits;
-    final buf = BytesBuilder();
-    buf.add(_int32(tid.length));
-    buf.add(tid);
-    buf.add(_int32(dest.length));
-    buf.add(dest);
-    buf.add(_int32(orig.length));
-    buf.add(orig);
-    buf.add(_int32(sequenceNumber));
-    buf.add(_int32(totalChunks));
-    buf.add(_int32(data.length));
-    buf.add(data);
-    buf.add(checksum.codeUnits);
-    return buf.toBytes();
+    final buf = <int>[];
+    buf.addAll(_int32(tid.length));
+    buf.addAll(tid);
+    buf.addAll(_int32(dest.length));
+    buf.addAll(dest);
+    buf.addAll(_int32(orig.length));
+    buf.addAll(orig);
+    buf.addAll(_int32(sequenceNumber));
+    buf.addAll(_int32(totalChunks));
+    buf.addAll(_int32(data.length));
+    buf.addAll(data);
+    buf.addAll(checksum.codeUnits);
+    return buf;
   }
 
   static List<int> _int32(int v) => [

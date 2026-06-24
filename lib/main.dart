@@ -10,10 +10,21 @@ void main() async {
 }
 
 Future<void> _requestPermissions() async {
-  await [
-    Permission.location,
-    Permission.nearbyWifiDevices,
-  ].request();
+  await Permission.location.request();
+  await Permission.nearbyWifiDevices.request();
+
+  // Android 13+ uses media permissions
+  await Permission.photos.request();
+  await Permission.videos.request();
+  await Permission.audio.request();
+
+  // Android 11-12 uses storage
+  await Permission.storage.request();
+
+  // Android 11+ manage external storage needs settings page
+  if (!await Permission.manageExternalStorage.isGranted) {
+    await openAppSettings();
+  }
 }
 
 class HyperlinkApp extends StatelessWidget {
@@ -24,9 +35,7 @@ class HyperlinkApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hyperlink',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF5B4FE8),
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF5B4FE8)),
         useMaterial3: true,
       ),
       home: const HomeScreen(),

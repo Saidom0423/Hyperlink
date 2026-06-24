@@ -1,19 +1,43 @@
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../providers/network_provider.dart';
 import '../models/peer_device.dart';
+import '../providers/network_provider.dart';
+import '../services/file_service.dart';
 
-class HomeScreen extends ConsumerWidget {
+class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  String? _lastReceivedName;
+
+  @override
+  Widget build(BuildContext context) {
     final network = ref.watch(networkProvider);
     final notifier = ref.read(networkProvider.notifier);
 
+    // Show snackbar when file received
+    final receivedName = network.transfer.lastReceivedName;
+    if (receivedName != null && receivedName != _lastReceivedName) {
+      _lastReceivedName = receivedName;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✅ Received: $receivedName'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      });
+    }
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('hyperlink'),
+        title: const Text('Hyperlink'),
         actions: [
           if (network.isScanning)
             const Padding(
@@ -31,16 +55,30 @@ class HomeScreen extends ConsumerWidget {
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(16),
-            color: Theme.of(context).colorScheme.surfaceVariant,
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
             child: Text(
               network.isScanning
                   ? 'Scanning for nearby devices...'
                   : 'Tap scan to find devices',
-              style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
 
-          // Error
+          // Transfer progress bar
+          if (network.transfer.activeFile != null)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Sending: ${network.transfer.activeFile}'),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(
+                    value: network.transfer.progress,
+                  ),
+                ],
+              ),
+            ),
+
           if (network.error != null)
             Padding(
               padding: const EdgeInsets.all(12),
@@ -56,8 +94,9 @@ class HomeScreen extends ConsumerWidget {
                 ? const Center(child: Text('No devices found yet'))
                 : ListView.builder(
               itemCount: network.peers.length,
-              itemBuilder: (ctx, i) =>
-                  _PeerTile(peer: network.peers[i]),
+              itemBuilder: (ctx, i) => _buildPeerTile(
+                context, network.peers[i], notifier,
+              ),
             ),
           ),
         ],
@@ -71,65 +110,88 @@ class HomeScreen extends ConsumerWidget {
       ),
     );
   }
-}
 
-class _PeerTile extends StatelessWidget {
-  final PeerDevice peer;
-
-  const _PeerTile({
-    required this.peer,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      onTap: () => _showSendOptions(context),
-      leading: CircleAvatar(
-        backgroundColor:
-        Theme.of(context).colorScheme.primaryContainer,
-        child: Text(peer.name[0].toUpperCase()),
-      ),
-      title: Text(peer.name),
-      subtitle: Text(
-        peer.hops == 0
-            ? '${peer.ip}:${peer.port} • direct'
-            : '${peer.hops} hop${peer.hops > 1 ? "s" : ""} away',
-      ),
-      trailing: Chip(
-        label: Text(peer.status.name),
-        backgroundColor: peer.status == PeerStatus.connected
-            ? Colors.green.shade100
-            : Colors.grey.shade200,
+  Widget _buildPeerTile(
+      BuildContext context,
+      PeerDevice peer,
+      NetworkNotifier notifier,
+      ) {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+          child: Text(
+            peer.name.isNotEmpty ? peer.name[0].toUpperCase() : '?',
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+        ),
+        title: Text(peer.name),
+        subtitle: Text(
+          peer.hops == 0
+              ? '${peer.ip} • direct'
+              : '${peer.hops} hop${peer.hops > 1 ? "s" : ""} away',
+        ),
+        trailing: FilledButton.icon(
+          onPressed: () => _sendFile(context, peer, notifier),
+          icon: const Icon(Icons.send, size: 16),
+          label: const Text('Send'),
+        ),
       ),
     );
   }
 
-  void _showSendOptions(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      builder: (_) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.send),
-              title: Text('Send file to ${peer.name}'),
-              subtitle: const Text('Pick a file to send'),
-              onTap: () {
-                Navigator.pop(context);
-
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text(
-                      'File picker coming next - transfer service ready!',
-                    ),
-                  ),
-                );
-              },
-            ),
-          ],
-        ),
+  Future<void> _sendFile(
+      BuildContext context,
+      PeerDevice peer,
+      NetworkNotifier notifier,
+      ) async {
+    // Show loading
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Opening file picker...'),
+        duration: Duration(seconds: 1),
       ),
     );
+
+    final path = await FileService.pickFile();
+
+    if (path == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No file selected')),
+        );
+      }
+      return;
+    }
+
+    final fileName = path.split('/').last;
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Sending $fileName to ${peer.name}...')),
+      );
+    }
+
+    try {
+      await notifier.sendFile(peer, path);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(' Sent $fileName to ${peer.name}'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(' Failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 }
