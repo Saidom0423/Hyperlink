@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:logger/logger.dart';
@@ -44,10 +45,43 @@ class DiscoveryService {
     }
   }
 
+  Future<String?> _getLocalIpAddress() async {
+    try {
+      final interfaces = await NetworkInterface.list();
+      for (final interface in interfaces) {
+        if (interface.name.toLowerCase().contains('wlan') ||
+            interface.name.toLowerCase().contains('eth')) {
+          for (final addr in interface.addresses) {
+            if (addr.type == InternetAddressType.IPv4 &&
+                !addr.isLoopback &&
+                !addr.address.startsWith('192.168.49.')) {
+              return addr.address;
+            }
+          }
+        }
+      }
+      for (final interface in interfaces) {
+        for (final addr in interface.addresses) {
+          if (addr.type == InternetAddressType.IPv4 &&
+              !addr.isLoopback &&
+              !addr.address.startsWith('192.168.49.')) {
+            return addr.address;
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
   Future<void> start() async {
     await _initDeviceName();
 
-    _localIp = await _networkInfo.getWifiIP();
+    _localIp = await _getLocalIpAddress();
+    if (_localIp == null) {
+      try {
+        _localIp = await _networkInfo.getWifiIP();
+      } catch (_) {}
+    }
 
     if (_localIp == null) {
       _log.w('No Wi-Fi IP — discovery skipped');

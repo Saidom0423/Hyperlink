@@ -1,11 +1,11 @@
 package com.example.hyperlink
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
-import android.content.ContentValues
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -13,14 +13,19 @@ import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : FlutterActivity() {
-    private val CHANNEL = "com.hyperlink/files"
+
+    private val FILE_CHANNEL = "com.hyperlink/files"
+    private val WIFI_DIRECT_CHANNEL = "com.hyperlink/wifi_direct"
     private val FILE_PICK_CODE = 1001
+
     private var pendingResult: MethodChannel.Result? = null
+    private lateinit var wifiDirectManager: WiFiDirectManager
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        // ── File channel ──────────────────────────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, FILE_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "pickFile" -> {
@@ -44,7 +49,79 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // ── WiFi Direct channel ───────────────────────────────────────────
+        wifiDirectManager = WiFiDirectManager(this)
+        wifiDirectManager.register()
+
+        val wifiChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            WIFI_DIRECT_CHANNEL
+        )
+
+        wifiDirectManager.onPeersChanged = { peers ->
+            runOnUiThread {
+                wifiChannel.invokeMethod("onPeersChanged", peers)
+            }
+        }
+
+        wifiDirectManager.onConnectionChanged = { info ->
+            runOnUiThread {
+                wifiChannel.invokeMethod("onConnectionChanged", info)
+            }
+        }
+
+        wifiChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "discoverPeers" -> {
+                    wifiDirectManager.discoverPeers(
+                        onSuccess = { result.success(true) },
+                        onFailure = { result.error("DISCOVERY_FAILED", "Reason: $it", null) }
+                    )
+                }
+                "getPeers" -> {
+                    result.success(wifiDirectManager.getPeers())
+                }
+                "connectPeer" -> {
+                    val address = call.argument<String>("address")!!
+                    wifiDirectManager.connect(
+                        address = address,
+                        onSuccess = { result.success(true) },
+                        onFailure = { result.error("CONNECT_FAILED", "Reason: $it", null) }
+                    )
+                }
+                "createGroup" -> {
+                    wifiDirectManager.createGroup(
+                        onSuccess = { result.success(true) },
+                        onFailure = { result.error("GROUP_FAILED", "Reason: $it", null) }
+                    )
+                }
+                "removeGroup" -> {
+                    wifiDirectManager.removeGroup(
+                        onSuccess = { result.success(true) },
+                        onFailure = { result.error("REMOVE_FAILED", "Reason: $it", null) }
+                    )
+                }
+                "getConnectionInfo" -> {
+                    result.success(wifiDirectManager.getConnectionInfo())
+                }
+                "disconnect" -> {
+                    wifiDirectManager.disconnect(
+                        onSuccess = { result.success(true) },
+                        onFailure = { result.error("DISCONNECT_FAILED", "Reason: $it", null) }
+                    )
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
+
+    override fun onDestroy() {
+        wifiDirectManager.unregister()
+        super.onDestroy()
+    }
+
+    // ── File helpers ──────────────────────────────────────────────────────
 
     private fun saveToDownloads(fileName: String, bytes: ByteArray): String? {
         return try {
@@ -55,8 +132,7 @@ class MainActivity : FlutterActivity() {
                     Environment.DIRECTORY_DOWNLOADS + "/Hyperlink")
             }
             val uri = contentResolver.insert(
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                contentValues
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues
             )
             uri?.let {
                 contentResolver.openOutputStream(it)?.use { stream ->
@@ -64,9 +140,7 @@ class MainActivity : FlutterActivity() {
                 }
                 it.toString()
             }
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
     private fun getMimeType(fileName: String): String {
@@ -101,9 +175,7 @@ class MainActivity : FlutterActivity() {
         val fileName = getFileName(uri) ?: "file_${System.currentTimeMillis()}"
         val cacheFile = File(cacheDir, fileName)
         contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(cacheFile).use { output ->
-                input.copyTo(output)
-            }
+            FileOutputStream(cacheFile).use { output -> input.copyTo(output) }
         }
         return cacheFile.absolutePath
     }
@@ -112,7 +184,9 @@ class MainActivity : FlutterActivity() {
         var name: String? = null
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
-                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                val idx = cursor.getColumnIndex(
+                    android.provider.OpenableColumns.DISPLAY_NAME
+                )
                 if (idx >= 0) name = cursor.getString(idx)
             }
         }

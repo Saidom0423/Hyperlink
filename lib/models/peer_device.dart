@@ -1,4 +1,8 @@
-enum PeerStatus { discovered, connected, relaying }
+enum PeerStatus {
+  discovered,
+  connected,
+  relaying,
+}
 
 class PeerDevice {
   final String id;
