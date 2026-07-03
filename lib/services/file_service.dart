@@ -35,4 +35,16 @@ class FileService {
       return null;
     }
   }
+
+  static Future<Uint8List?> loadBackupFile(String fileName) async {
+    try {
+      final bytes = await _channel.invokeMethod<Uint8List>(
+        'loadBackupFile',
+        {'fileName': fileName},
+      );
+      return bytes;
+    } catch (e) {
+      return null;
+    }
+  }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/network_provider.dart';
 import '../services/wifi_direct_service.dart';
+import '../services/accessibility_service.dart';
 
 class WifiDirectScreen extends ConsumerStatefulWidget {
   const WifiDirectScreen({super.key});
@@ -10,13 +11,15 @@ class WifiDirectScreen extends ConsumerStatefulWidget {
   ConsumerState<WifiDirectScreen> createState() => _WifiDirectScreenState();
 }
 
-class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
+class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen>
+    with WidgetsBindingObserver {
   List<Map<String, String>> _peers = [];
   Map<String, dynamic> _connectionInfo = {};
   bool _connecting = false;
   bool _discovering = false;
   String? _connectingAddress;
   String _status = 'Starting Wi-Fi Direct discovery...';
+  bool _autoAcceptEnabled = false;
 
   // Saved so we can restore NetworkNotifier's callbacks on dispose
   void Function(List<Map<String, String>>)? _savedOnPeersChanged;
@@ -25,6 +28,9 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _checkAutoAcceptStatus();
 
     // Layer our local UI callbacks on top of NetworkNotifier's global ones.
     final prevPeersChanged = WifiDirectService.onPeersChanged;
@@ -65,11 +71,29 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // Restore the NetworkNotifier callbacks so WFD events keep flowing
     // to the provider after this screen is popped.
     WifiDirectService.onPeersChanged = _savedOnPeersChanged;
     WifiDirectService.onConnectionChanged = _savedOnConnectionChanged;
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Re-check accessibility status when returning from Settings
+    if (state == AppLifecycleState.resumed) {
+      _checkAutoAcceptStatus();
+    }
+  }
+
+  Future<void> _checkAutoAcceptStatus() async {
+    try {
+      final enabled = await AccessibilityService.isEnabled();
+      if (mounted && enabled != _autoAcceptEnabled) {
+        setState(() => _autoAcceptEnabled = enabled);
+      }
+    } catch (_) {}
   }
 
   Future<void> _discoverPeers() async {
@@ -105,6 +129,11 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
     });
     try {
       final wfd = WifiDirectService();
+      try {
+        await wfd.removeGroup();
+        await Future.delayed(const Duration(milliseconds: 600)); // Allow Android P2P state machine to teardown group
+      } catch (_) {}
+      
       await wfd.connectPeer(address);
       if (!mounted) return;
       setState(() => _status = 'Connection request sent to $name. Please accept on their device.');
@@ -136,6 +165,8 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
   @override
   Widget build(BuildContext context) {
     final groupFormed = _connectionInfo['groupFormed'] == true;
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
 
     return Scaffold(
       appBar: AppBar(
@@ -153,6 +184,113 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
       ),
       body: Column(
         children: [
+          // ── Auto-Accept card ──────────────────────────────────────────
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              gradient: _autoAcceptEnabled
+                  ? LinearGradient(
+                      colors: [
+                        Colors.green.shade50,
+                        Colors.green.shade100.withValues(alpha: 0.5),
+                      ],
+                    )
+                  : LinearGradient(
+                      colors: [
+                        Colors.orange.shade50,
+                        Colors.orange.shade100.withValues(alpha: 0.5),
+                      ],
+                    ),
+              border: Border.all(
+                color: _autoAcceptEnabled
+                    ? Colors.green.shade300
+                    : Colors.orange.shade300,
+                width: 1,
+              ),
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(12),
+                onTap: _autoAcceptEnabled
+                    ? null
+                    : () => AccessibilityService.openSettings(),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 12),
+                  child: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: _autoAcceptEnabled
+                              ? Colors.green.shade100
+                              : Colors.orange.shade100,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          _autoAcceptEnabled
+                              ? Icons.verified_rounded
+                              : Icons.touch_app_rounded,
+                          color: _autoAcceptEnabled
+                              ? Colors.green.shade700
+                              : Colors.orange.shade700,
+                          size: 20,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _autoAcceptEnabled
+                                  ? 'Auto-Accept Active'
+                                  : 'Auto-Accept Disabled',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 14,
+                                color: _autoAcceptEnabled
+                                    ? Colors.green.shade800
+                                    : Colors.orange.shade800,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              _autoAcceptEnabled
+                                  ? 'Incoming connection requests will be accepted automatically'
+                                  : 'Tap to enable auto-accept in Accessibility Settings',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: _autoAcceptEnabled
+                                    ? Colors.green.shade600
+                                    : Colors.orange.shade700,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (!_autoAcceptEnabled)
+                        Icon(
+                          Icons.arrow_forward_ios_rounded,
+                          size: 16,
+                          color: Colors.orange.shade400,
+                        ),
+                      if (_autoAcceptEnabled)
+                        Icon(
+                          Icons.check_circle,
+                          color: Colors.green.shade600,
+                          size: 22,
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+
           // Status card
           Container(
             width: double.infinity,
@@ -161,7 +299,7 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
             decoration: BoxDecoration(
               color: groupFormed
                   ? Colors.green.shade50
-                  : Theme.of(context).colorScheme.surfaceContainerHighest,
+                  : colorScheme.surfaceContainerHighest,
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
                 color: groupFormed ? Colors.green.shade300 : Colors.transparent,
@@ -247,7 +385,7 @@ class _WifiDirectScreenState extends ConsumerState<WifiDirectScreen> {
                         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                         child: ListTile(
                           leading: CircleAvatar(
-                            backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                            backgroundColor: colorScheme.primaryContainer,
                             child: Text(
                               name.isNotEmpty ? name[0].toUpperCase() : '?',
                             ),

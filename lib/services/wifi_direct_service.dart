@@ -62,4 +62,40 @@ class WifiDirectService {
   Future<void> disconnect() async {
     await _channel.invokeMethod('disconnect');
   }
+
+  Future<bool> startAdvertising(String hash) async {
+    final result = await _channel.invokeMethod<bool>(
+      'startAdvertising',
+      {'hash': hash},
+    );
+    return result ?? false;
+  }
+
+  Future<bool> stopAdvertising() async {
+    final result = await _channel.invokeMethod<bool>('stopAdvertising');
+    return result ?? false;
+  }
+
+  Future<bool> startServiceDiscovery() async {
+    final result = await _channel.invokeMethod<bool>('startServiceDiscovery');
+    return result ?? false;
+  }
+
+  Future<bool> stopServiceDiscovery() async {
+    final result = await _channel.invokeMethod<bool>('stopServiceDiscovery');
+    return result ?? false;
+  }
+
+  Future<void> clearDiscoveredPeers() async {
+    await _channel.invokeMethod('clearDiscoveredPeers');
+  }
+
+  Future<bool> isWifiEnabled() async {
+    final result = await _channel.invokeMethod<bool>('isWifiEnabled');
+    return result ?? false;
+  }
+
+  Future<void> openWifiSettings() async {
+    await _channel.invokeMethod('openWifiSettings');
+  }
 }

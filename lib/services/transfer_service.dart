@@ -1,27 +1,113 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:logger/logger.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pointycastle/digests/sha256.dart';
+import 'package:convert/convert.dart';
 import '../models/peer_device.dart';
-import '../services/file_service.dart';
+import 'crypto_service.dart';
+import 'file_service.dart';
+import 'profile_service.dart';
+
+class SocketReader {
+  final Socket socket;
+  final List<int> _buffer = [];
+  Completer<void>? _dataCompleter;
+  StreamSubscription? _subscription;
+  bool _done = false;
+
+  SocketReader(this.socket) {
+    _subscription = socket.listen(
+      (data) {
+        _buffer.addAll(data);
+        if (_dataCompleter != null && !_dataCompleter!.isCompleted) {
+          _dataCompleter!.complete();
+        }
+      },
+      onDone: () {
+        _done = true;
+        if (_dataCompleter != null && !_dataCompleter!.isCompleted) {
+          _dataCompleter!.complete();
+        }
+      },
+      onError: (e) {
+        _done = true;
+        if (_dataCompleter != null && !_dataCompleter!.isCompleted) {
+          _dataCompleter!.completeError(e);
+        }
+      },
+    );
+  }
+
+  Future<Uint8List> readBytes(int count) async {
+    while (_buffer.length < count && !_done) {
+      _dataCompleter = Completer<void>();
+      await _dataCompleter!.future;
+    }
+    if (_buffer.length < count) {
+      throw StateError("Socket closed before reading $count bytes.");
+    }
+    final result = Uint8List.fromList(_buffer.sublist(0, count));
+    _buffer.removeRange(0, count);
+    return result;
+  }
+
+  Future<Map<String, dynamic>> readJson() async {
+    final lenBytes = await readBytes(4);
+    final len = ByteData.view(lenBytes.buffer).getInt32(0);
+    final jsonBytes = await readBytes(len);
+    return jsonDecode(utf8.decode(jsonBytes)) as Map<String, dynamic>;
+  }
+
+  Future<void> pipeToFile(File file, int count, void Function(double progress)? onProgress) async {
+    final sink = file.openWrite(mode: FileMode.writeOnlyAppend);
+    int remaining = count;
+    while (remaining > 0) {
+      if (_buffer.isEmpty) {
+        if (_done) break;
+        _dataCompleter = Completer<void>();
+        await _dataCompleter!.future;
+      }
+      if (_buffer.isNotEmpty) {
+        final toWrite = _buffer.length.clamp(0, remaining);
+        final chunk = _buffer.sublist(0, toWrite);
+        sink.add(chunk);
+        _buffer.removeRange(0, toWrite);
+        remaining -= toWrite;
+        onProgress?.call((count - remaining) / count);
+      }
+    }
+    await sink.flush();
+    await sink.close();
+    if (remaining > 0) {
+      throw StateError("Socket closed with $remaining bytes remaining to read");
+    }
+  }
+
+  Future<void> close() async {
+    await _subscription?.cancel();
+  }
+}
 
 class TransferService {
   static const int port = 8765;
-  static const int chunkSize = 256 * 1024; // 256KB
-
   final Logger _log = Logger();
   ServerSocket? _server;
 
   final void Function(String fileName, double progress) onReceiveProgress;
-  final void Function(String fileName, String savePath) onReceiveComplete;
+  final void Function(String fileName, String savePath, String senderId, String senderName) onReceiveComplete;
+  final void Function(String remoteIp)? onConnectionReceived;
+  final void Function(String fileName, double progress)? onSendProgress;
 
   TransferService({
     required this.onReceiveProgress,
     required this.onReceiveComplete,
+    this.onConnectionReceived,
+    this.onSendProgress,
   });
-
-  // ── Start TCP server to receive files ───────────────────────────────────
 
   Future<void> startServer() async {
     try {
@@ -29,7 +115,9 @@ class TransferService {
       _log.i('Transfer server listening on port $port');
 
       _server!.listen((socket) {
-        _log.i('Incoming connection from ${socket.remoteAddress.address}');
+        final remoteIp = socket.remoteAddress.address;
+        _log.i('Incoming connection from $remoteIp');
+        onConnectionReceived?.call(remoteIp);
         _handleIncoming(socket);
       });
     } catch (e) {
@@ -44,90 +132,123 @@ class TransferService {
     _log.i('Transfer server stopped.');
   }
 
+  static Future<void> writeJson(Socket socket, Map<String, dynamic> json) async {
+    final str = jsonEncode(json);
+    final bytes = utf8.encode(str);
+    final lenBytes = Uint8List(4);
+    ByteData.view(lenBytes.buffer).setInt32(0, bytes.length);
+    socket.add(lenBytes);
+    socket.add(bytes);
+    await socket.flush();
+  }
+
+  static Future<String> calculateFileChecksum(File file) async {
+    final digest = SHA256Digest();
+    final stream = file.openRead();
+    await for (final chunk in stream) {
+      digest.update(Uint8List.fromList(chunk), 0, chunk.length);
+    }
+    final hash = Uint8List(digest.digestSize);
+    digest.doFinal(hash, 0);
+    return hex.encode(hash);
+  }
+
   // ── Receive a file ───────────────────────────────────────────────────────
-
   Future<void> _handleIncoming(Socket socket) async {
+    final reader = SocketReader(socket);
+    File? partialFile;
     try {
-      final bytes = <int>[];
-      await for (final chunk in socket) {
-        bytes.addAll(chunk);
-        // Note: For future huge files, stream this straight to a temp file instead of holding in memory!
-      }
+      final meta = await reader.readJson();
+      final senderId = meta['senderId'] as String? ?? 'unknown_sender';
+      final senderName = meta['senderName'] as String? ?? 'Contact';
+      final fileName = meta['fileName'] as String;
+      final fileSize = meta['fileSize'] as int;
+      final checksum = meta['checksum'] as String;
+      final encryptedKey = meta['encryptedKey'] as String;
+      final iv = meta['iv'] as String;
 
-      if (bytes.isEmpty) {
-        _log.w('Received empty byte stream from socket.');
-        return;
-      }
+      final tempDir = await getTemporaryDirectory();
+      final partialPath = '${tempDir.path}/temp_$checksum.part';
+      partialFile = File(partialPath);
 
-      // Read Header (First 4 Bytes = Length of file name)
-      final nameLen = ByteData.sublistView(
-          Uint8List.fromList(bytes.sublist(0, 4))
-      ).getInt32(0);
-
-      final fileName = String.fromCharCodes(bytes.sublist(4, 4 + nameLen));
-      final fileData = bytes.sublist(4 + nameLen);
-
-      _log.i('File payload extracted: $fileName (${fileData.length} bytes)');
-
-      String? savedPath;
-
-      // 1. Try MediaStore first (Android 10+)
-      try {
-        _log.i('Attempting MediaStore save...');
-        savedPath = await FileService.saveFile(fileName, fileData);
-        if (savedPath != null) _log.i('Saved via MediaStore: $savedPath');
-      } catch (e) {
-        _log.e('MediaStore save failed: $e');
-      }
-
-      // 2. Fallback — write directly to Shared Downloads folder
-      if (savedPath == null) {
-        try {
-          _log.i('Attempting Download folder fallback...');
-          final dir = Directory('/storage/emulated/0/Download/Hyperlink');
-          if (!await dir.exists()) await dir.create(recursive: true);
-          final path = '${dir.path}/$fileName';
-          await File(path).writeAsBytes(fileData);
-          savedPath = path;
-          _log.i('Saved via fallback: $savedPath');
-        } catch (e) {
-          _log.e('Shared Downloads fallback save failed: $e');
-        }
-      }
-
-      // 3. Last resort — App private external storage directory
-      if (savedPath == null) {
-        try {
-          _log.i('Attempting App Private Storage fallback...');
-          final dir = await getExternalStorageDirectory();
-          if (dir != null) {
-            final path = '${dir.path}/$fileName';
-            await File(path).writeAsBytes(fileData);
-            savedPath = path;
-            _log.i('Saved to app storage: $savedPath');
-          }
-        } catch (e) {
-          _log.e('App private storage save failed: $e');
-        }
-      }
-
-      if (savedPath != null) {
-        onReceiveComplete(fileName, savedPath);
+      int receivedBytes = 0;
+      if (await partialFile.exists()) {
+        receivedBytes = await partialFile.length();
       } else {
-        _log.e('Failed to save file across all destination fallbacks.');
+        await partialFile.create();
       }
+
+      // Send resume response
+      await writeJson(socket, {'receivedBytes': receivedBytes});
+
+      if (receivedBytes < fileSize) {
+        // Read the remaining bytes from the socket
+        await reader.pipeToFile(
+          partialFile,
+          fileSize - receivedBytes,
+          (progress) {
+            final totalProgress = (receivedBytes + (progress * (fileSize - receivedBytes))) / fileSize;
+            onReceiveProgress(fileName, totalProgress);
+          },
+        );
+      }
+
+      // Transfer completed successfully
+      _log.i('Received complete encrypted file: $fileName, decrypting...');
+
+      // Decrypt file
+      final encryptedBytes = await partialFile.readAsBytes();
+      final privateKey = ProfileService.currentProfile!.privateKey;
+      final decryptedBytes = await CryptoService.decryptBytes(
+        encryptedKey: encryptedKey,
+        iv: iv,
+        encryptedData: encryptedBytes,
+        privateKey: privateKey,
+      );
+
+      // Verify checksum
+      final decryptedDigest = SHA256Digest().process(decryptedBytes);
+      final decryptedChecksum = hex.encode(decryptedDigest);
+      if (decryptedChecksum != checksum) {
+        throw StateError("File integrity check failed: Checksum mismatch");
+      }
+
+      // Save local copy for app/chat rendering
+      final appDir = await getApplicationDocumentsDirectory();
+      final receivedDir = Directory('${appDir.path}/received_files');
+      if (!await receivedDir.exists()) await receivedDir.create(recursive: true);
+      final localPath = '${receivedDir.path}/$fileName';
+      await File(localPath).writeAsBytes(decryptedBytes);
+
+      // Save public copy in Downloads folder
+      String? savedPath = await FileService.saveFile(fileName, decryptedBytes);
+      if (savedPath == null) {
+        final destDir = Directory('/storage/emulated/0/Download/Hyperlink');
+        if (!await destDir.exists()) await destDir.create(recursive: true);
+        final path = '${destDir.path}/$fileName';
+        await File(path).writeAsBytes(decryptedBytes);
+        savedPath = path;
+      }
+
+      _log.i('File decrypted and saved. Public: $savedPath, Local: $localPath');
+      onReceiveComplete(fileName, localPath, senderId, senderName);
+
+      // Cleanup partial file
+      await partialFile.delete();
     } catch (e) {
-      _log.e('Receive error processing incoming socket payload: $e');
+      _log.e('Receive error: $e');
     } finally {
+      await reader.close();
       await socket.close();
     }
   }
 
   // ── Send a file ──────────────────────────────────────────────────────────
-
   Future<void> sendFile({
     required PeerDevice peer,
     required String filePath,
+    required String senderId,
+    required String senderName,
   }) async {
     final file = File(filePath);
     if (!await file.exists()) {
@@ -135,47 +256,73 @@ class TransferService {
     }
 
     final fileName = file.uri.pathSegments.last;
-    final fileBytes = await file.readAsBytes();
-
-    _log.i('Sending $fileName (${fileBytes.length} bytes) to ${peer.ip}');
-
-    debugPrint("========== SEND ==========");
-    debugPrint("Peer name : ${peer.name}");
-    debugPrint("Peer IP   : '${peer.ip}'");
-    debugPrint("Peer port : ${peer.port}");
-    debugPrint("==========================");
+    _log.i('Encrypting and sending $fileName to ${peer.ip}');
 
     if (peer.ip.isEmpty) {
-      throw ArgumentError("Cannot connect! Target peer IP is blank. Verify Wi-Fi Direct connection info extraction.");
+      throw ArgumentError("Cannot connect! Target peer IP is blank.");
     }
 
-    final socket = await Socket.connect(
-      peer.ip,
-      peer.port,
-      timeout: const Duration(seconds: 10),
-    );
+    // 1. Calculate checksum
+    final checksum = await calculateFileChecksum(file);
 
-    // Write header string metadata info
-    final nameBytes = fileName.codeUnits;
-    final header = ByteData(4);
-    header.setInt32(0, nameBytes.length);
+    // 2. Encrypt original file bytes
+    final originalBytes = await file.readAsBytes();
+    final encryptedMap = await CryptoService.encryptBytes(originalBytes, peer.publicKey);
+    final encryptedKey = encryptedMap['encryptedKey'] as String;
+    final iv = encryptedMap['iv'] as String;
+    final encryptedData = encryptedMap['encryptedData'] as Uint8List;
 
-    socket.add(header.buffer.asUint8List());
-    socket.add(nameBytes);
+    // 3. Save encrypted file to a temporary file
+    final tempDir = await getTemporaryDirectory();
+    final tempEncFile = File('${tempDir.path}/enc_$checksum.tmp');
+    await tempEncFile.writeAsBytes(encryptedData);
+    final encryptedSize = encryptedData.length;
 
-    // Write file payload in chunks with progress reporting updates
-    int sent = 0;
-    while (sent < fileBytes.length) {
-      final end = (sent + chunkSize).clamp(0, fileBytes.length);
-      socket.add(fileBytes.sublist(sent, end));
-      sent = end;
+    Socket? socket;
+    SocketReader? reader;
+    try {
+      socket = await Socket.connect(
+        peer.ip,
+        peer.port,
+        timeout: const Duration(seconds: 10),
+      );
+      reader = SocketReader(socket);
 
-      // Updates the notification/UI state contextually
-      onReceiveProgress(fileName, sent / fileBytes.length);
+      // Send metadata JSON
+      await writeJson(socket, {
+        'senderId': senderId,
+        'senderName': senderName,
+        'fileName': fileName,
+        'fileSize': encryptedSize,
+        'checksum': checksum,
+        'encryptedKey': encryptedKey,
+        'iv': iv,
+      });
+
+      // Read resume response
+      final resp = await reader.readJson();
+      final int skipBytes = resp['receivedBytes'] as int? ?? 0;
+
+      // Stream remaining bytes
+      final fileStream = tempEncFile.openRead(skipBytes);
+      int sent = skipBytes;
+
+      await for (final chunk in fileStream) {
+        socket.add(chunk);
+        sent += chunk.length;
+        (onSendProgress ?? onReceiveProgress)(fileName, sent / encryptedSize);
+      }
+
+      await socket.flush();
+    } catch (e) {
+      _log.e('Send file error: $e');
+      rethrow;
+    } finally {
+      await reader?.close();
+      await socket?.close();
+      try {
+        if (await tempEncFile.exists()) await tempEncFile.delete();
+      } catch (_) {}
     }
-
-    await socket.flush();
-    await socket.close();
-    _log.i('File completely sent: $fileName');
   }
 }

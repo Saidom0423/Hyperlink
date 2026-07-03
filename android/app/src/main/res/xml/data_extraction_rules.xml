@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Include the app's files directory where Isar database resides -->
+        <include domain="file" path="."/>
+    </cloud-backup>
+    <device-to-device-backup>
+        <!-- Include the app's files directory where Isar database resides -->
+        <include domain="file" path="."/>
+    </device-to-device-backup>
+</data-extraction-rules>

@@ -1,5 +1,6 @@
 class RouteEntry {
   final String destinationId;
+  final String? destinationName;
   final String nextHopId;    // direct peer we send to
   final String nextHopIp;
   final int nextHopPort;
@@ -8,15 +9,16 @@ class RouteEntry {
 
   RouteEntry({
     required this.destinationId,
+    this.destinationName,
     required this.nextHopId,
     required this.nextHopIp,
-    required this.nextHopPort,
+    this.nextHopPort = 8767,
     required this.hopCount,
     required this.lastSeen,
   });
 
   bool get isExpired =>
-      DateTime.now().difference(lastSeen).inSeconds > 30;
+      DateTime.now().difference(lastSeen).inSeconds > 20;
 }
 
 class RoutingTable {
@@ -35,10 +37,13 @@ class RoutingTable {
     return r;
   }
 
-  void invalidate(String deviceId) {
+  void invalidate(String identifier) {
     _routes.removeWhere((k, v) =>
-    k == deviceId || v.nextHopId == deviceId);
+        k == identifier || v.nextHopId == identifier || v.nextHopIp == identifier);
   }
 
-  List<RouteEntry> get allRoutes => _routes.values.toList();
+  List<RouteEntry> get allRoutes {
+    _routes.removeWhere((k, v) => v.isExpired);
+    return _routes.values.toList();
+  }
 }
